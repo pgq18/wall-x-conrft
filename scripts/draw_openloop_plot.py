@@ -28,10 +28,10 @@ if __name__ == "__main__":
     pred_horizon = args.pred_horizon
 
     # get train config
-    model_path = "/path/to/model"
+    model_path = "/home/pgq/Models/wall-oss-flow"
     action_tokenizer_path = "/path/to/action/tokenizer"
-    save_dir = "/path/to/save/dir"
-    path = "/path/to/train/config"
+    save_dir = "/home/pgq/Workspace/VLA/conrft-modified/wall-x-conrft/workspace/lerobot_example/plots"
+    path = "/home/pgq/Workspace/VLA/conrft-modified/wall-x-conrft/workspace/lerobot_example/config_qact.yml"
     config = load_config(path)
 
     # load model with customized robot config
@@ -82,7 +82,7 @@ if __name__ == "__main__":
             denormalized_gt = (
                 model.action_preprocessor.normalizer_action.unnormalize_data(
                     gt_action_chunk,
-                    [lerobot_config.get("repo_id", "physical-intelligence/libero")],
+                    [lerobot_config.get("repo_id", "penggq/task_0")],
                     dof_mask,
                 ).squeeze(0)
             )

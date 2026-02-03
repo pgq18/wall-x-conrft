@@ -43,6 +43,14 @@ KEY_MAPPINGS = {
         "state": "observation.state",
         "action": "action",
     },
+    "penggq/task_0": {
+        "camera": {
+            "observation.images.wrist": "wrist",
+            "observation.images.up": "up"
+        },
+        "state": "observation.state",
+        "action": "action",
+    },
 }
 
 CAMERA_NAME_MAPPING = {

@@ -815,7 +815,7 @@ class Qwen2_5_VLMoEForAction(Qwen2_5_VLForConditionalGeneration):
         config_path = os.path.join(pretrained_model_path, "config.json")
         config = cls.config_class.from_pretrained(config_path)
         processor = AutoProcessor.from_pretrained(pretrained_model_path, use_fast=True)
-        if action_tokenizer_path is not None:
+        if train_config["use_fast_tokenizer"] and action_tokenizer_path is not None:
             processor.action_processor = AutoProcessor.from_pretrained(
                 action_tokenizer_path, trust_remote_code=True
             )
