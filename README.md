@@ -48,17 +48,18 @@ Install requirements:
 ```bash
 pip install -r requirements.txt
 pip install torch==2.7.0 torchvision==0.22.0 torchaudio==2.7.0 --index-url https://download.pytorch.org/whl/cu128
-MAX_JOBS=4 pip install flash-attn==2.7.4.post1 --no-build-isolation
+# MAX_JOBS=4 pip install flash-attn==2.7.4.post1 --no-build-isolation
+wget https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.4.post1/flash_attn-2.7.4.post1+cu12torch2.7cxx11abiFALSE-cp310-cp310-linux_x86_64.whl
 pip install ./flash_attn-2.7.4.post1+cu12torch2.7cxx11abiFALSE-cp310-cp310-linux_x86_64.whl
 ```
 
-Install lerobot:
+<!-- Install lerobot:
 ```bash
 git clone https://github.com/huggingface/lerobot.git
-git checkout c66cd401767e60baece16e1cf68da2824227e076
 cd lerobot
+git checkout c66cd401767e60baece16e1cf68da2824227e076
 pip install -e .
-```
+``` -->
 
 Install wall_x:
 ```bash
