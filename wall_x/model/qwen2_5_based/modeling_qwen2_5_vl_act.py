@@ -1584,6 +1584,263 @@ class Qwen2_5_VLMoEForAction(Qwen2_5_VLForConditionalGeneration):
             channel_loss_dict=channel_loss_dict,
             channel_loss_count_dict=channel_loss_count_dict,
         )
+    
+    def get_embeddings(
+        self,
+        input_ids: torch.LongTensor = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[List[torch.FloatTensor]] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        moe_token_types: Optional[
+            torch.LongTensor
+        ] = None,  # MoE token type assignments
+        labels: Optional[torch.LongTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        pixel_values: Optional[torch.Tensor] = None,
+        pixel_values_videos: Optional[torch.FloatTensor] = None,
+        image_grid_thw: Optional[torch.LongTensor] = None,
+        video_grid_thw: Optional[torch.LongTensor] = None,
+        action_chunk: Optional[torch.FloatTensor] = None,  # Action trajectory chunks
+        proprioception: Optional[
+            torch.FloatTensor
+        ] = None,  # Joint position/orientation data
+        rope_deltas: Optional[torch.LongTensor] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        second_per_grid_ts: Optional[torch.Tensor] = None,
+        dataset_names: Optional[str] = None,
+        dof_mask: Optional[torch.FloatTensor] = None,
+        agent_pos_mask: Optional[torch.FloatTensor] = None,
+        **kwargs,
+    ) -> Union[Tuple, Qwen2_5_VLACausalLMOutputWithPast]:
+        """
+        Forward pass for training with multi-modal inputs including vision, text, and action data.
+
+        This method handles the complete forward pass during training, processing various input modalities
+        including images, videos, text, proprioceptive data, and action sequences. It computes losses
+        for both language modeling and action prediction using flow matching.
+
+        Args:
+            input_ids (torch.LongTensor, optional): Input token IDs
+            attention_mask (torch.Tensor, optional): Attention mask for input tokens
+            position_ids (torch.LongTensor, optional): Position IDs for tokens
+            past_key_values (List[torch.FloatTensor], optional): Cached key-value pairs for generation
+            inputs_embeds (torch.FloatTensor, optional): Pre-computed input embeddings
+            moe_token_types (torch.LongTensor, optional): Token type assignments for MoE routing
+            labels (torch.LongTensor, optional): Target labels for loss computation
+            use_cache (bool, optional): Whether to use key-value caching
+            output_attentions (bool, optional): Whether to return attention weights
+            output_hidden_states (bool, optional): Whether to return hidden states
+            return_dict (bool, optional): Whether to return structured output
+            pixel_values (torch.Tensor, optional): Image pixel values
+            pixel_values_videos (torch.FloatTensor, optional): Video pixel values
+            image_grid_thw (torch.LongTensor, optional): Image grid dimensions (temporal, height, width)
+            video_grid_thw (torch.LongTensor, optional): Video grid dimensions (temporal, height, width)
+            action_chunk (torch.FloatTensor, optional): Action trajectory data chunks
+            proprioception (torch.FloatTensor, optional): Proprioceptive sensor data (joint positions, etc.)
+            rope_deltas (torch.LongTensor, optional): RoPE position deltas
+            cache_position (torch.LongTensor, optional): Cache position indices
+            second_per_grid_ts (torch.Tensor, optional): Time interval per temporal grid
+            dataset_names (str, optional): Names of datasets in the current batch
+            dof_mask (torch.FloatTensor, optional): Degrees of freedom mask for action tokens
+            agent_pos_mask (torch.FloatTensor, optional): Agent position mask for proprioceptive data
+            **kwargs: Additional keyword arguments
+
+        Returns:
+            Union[Tuple, Qwen2_5_VLACausalLMOutputWithPast]: Model outputs including losses, logits,
+                and auxiliary information, or tuple if return_dict=False
+        """
+        batch_size, seq_length = input_ids.shape
+
+        # Set output configuration from model config if not specified
+        output_attentions = (
+            output_attentions
+            if output_attentions is not None
+            else self.config.output_attentions
+        )
+        output_hidden_states = (
+            output_hidden_states
+            if output_hidden_states is not None
+            else self.config.output_hidden_states
+        )
+        return_dict = (
+            return_dict if return_dict is not None else self.config.use_return_dict
+        )
+
+        # Calculate RoPE position IDs if not provided
+        # Note: Cannot calculate rope deltas with 4D attention mask. TODO: Fix this limitation
+        if position_ids is None and (
+            attention_mask is None or attention_mask.ndim == 2
+        ):
+            # Calculate RoPE index once per generation in the pre-fill stage only
+            if (
+                (cache_position is not None and cache_position[0] == 0)
+                or self.rope_deltas is None
+                or (past_key_values is None or past_key_values.get_seq_length() == 0)
+            ):
+                position_ids, rope_deltas = ops.get_rope_index(
+                    input_ids=input_ids,
+                    image_grid_thw=image_grid_thw,
+                    video_grid_thw=video_grid_thw,
+                    second_per_grid_ts=second_per_grid_ts,
+                    attention_mask=attention_mask,
+                    spatial_merge_size=self.config.vision_config.spatial_merge_size,
+                    image_token_id=self.config.image_token_id,
+                    video_token_id=self.config.video_token_id,
+                    vision_start_token_id=self.config.vision_start_token_id,
+                    tokens_per_second=self.config.vision_config.tokens_per_second,
+                )
+                self.rope_deltas = rope_deltas
+            # Use previously calculated rope deltas to get correct position IDs
+            else:
+                delta = (
+                    (cache_position[0] + self.rope_deltas).to(self.device)
+                    if cache_position is not None
+                    else 0
+                )
+                position_ids = torch.arange(seq_length, device=self.device)
+                position_ids = position_ids.view(1, -1).expand(batch_size, -1)
+                if cache_position is not None:  # otherwise `deltas` is an int `0`
+                    delta = delta.repeat_interleave(batch_size // delta.shape[0], dim=0)
+                position_ids = position_ids.add(delta)
+                position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
+
+        # Calculate token distribution across MoE expert groups
+        group_size = torch.zeros(
+            self.config.num_experts, dtype=torch.long, device="cpu"
+        )
+        for i in range(self.config.num_experts):
+            group_size[i] = (moe_token_types == i).sum()
+
+        # Calculate start and end indices for each expert group
+        start_indices = torch.cumsum(group_size, dim=0) - group_size
+        end_indices = torch.cumsum(group_size, dim=0)
+
+        # Process input embeddings with multi-modal data
+        if inputs_embeds is None:
+            inputs_embeds = self.model.embed_tokens(input_ids)
+
+            # Process image embeddings
+            if pixel_values is not None:
+                pixel_values = pixel_values.type(self.visual.dtype)
+                image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
+                mask = input_ids == self.config.image_token_id
+                mask_unsqueezed = mask.unsqueeze(-1)
+                mask_expanded = mask_unsqueezed.expand_as(inputs_embeds)
+                image_mask = mask_expanded.to(inputs_embeds.device)
+
+                image_embeds = image_embeds.to(
+                    inputs_embeds.device, inputs_embeds.dtype
+                )
+                inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+
+            # Process video embeddings
+            if pixel_values_videos is not None:
+                pixel_values_videos = pixel_values_videos.type(self.visual.dtype)
+                video_embeds = self.visual(pixel_values_videos, grid_thw=video_grid_thw)
+                n_video_tokens = (input_ids == self.config.video_token_id).sum().item()
+                n_video_features = video_embeds.shape[0]
+
+                # Validate video token and feature count match
+                if n_video_tokens != n_video_features:
+                    raise ValueError(
+                        f"Video features and video tokens do not match: tokens: {n_video_tokens}, features {n_video_features}"
+                    )
+                mask = input_ids == self.config.video_token_id
+                mask_unsqueezed = mask.unsqueeze(-1)
+                mask_expanded = mask_unsqueezed.expand_as(inputs_embeds)
+                video_mask = mask_expanded.to(inputs_embeds.device)
+
+                video_embeds = video_embeds.to(
+                    inputs_embeds.device, inputs_embeds.dtype
+                )
+                inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
+
+            # Process proprioceptive data (joint positions, orientations, etc.)
+            if proprioception is not None:
+                proprioception = proprioception.to(inputs_embeds.device).to(
+                    inputs_embeds.dtype
+                )
+                agent_pos_mask = agent_pos_mask.to(inputs_embeds.device).to(
+                    inputs_embeds.dtype
+                )
+                proprioception = self.action_preprocessor.proprioception_proj(
+                    proprioception,
+                    dataset_names,
+                    agent_pos_mask,
+                    use_history=proprioception.shape[1] > 1,
+                )
+                mask = input_ids == self.action_token_id_set["propri_token_id"]
+                mask_unsqueezed = mask.unsqueeze(-1)
+                mask_expanded = mask_unsqueezed.expand_as(inputs_embeds)
+                proprioception_mask = mask_expanded.to(inputs_embeds.device)
+
+                proprioception = proprioception.to(
+                    inputs_embeds.device, inputs_embeds.dtype
+                )
+                inputs_embeds = inputs_embeds.masked_scatter(
+                    proprioception_mask, proprioception
+                )
+            elif self.training:
+                # Dummy forward pass to ensure gradient registration in DDP
+                # This handles cases where one process has proprioception data while another doesn't
+                # Without this, DDP would hang waiting for a gradient that will never be computed
+                dummy_input = torch.randn(
+                    2,
+                    self.action_preprocessor.propri_dim * 2,
+                    device=inputs_embeds.device,
+                )
+                dummy_forward = self.action_preprocessor.proprioception_proj(
+                    dummy_input
+                )
+                dummy_loss = sum(p.sum() for p in dummy_forward)
+                inputs_embeds = inputs_embeds + 0 * dummy_loss
+
+            # Process action chunk data
+            if action_chunk is not None:
+                action_chunk = action_chunk.to(inputs_embeds.device).to(
+                    inputs_embeds.dtype
+                )
+                dof_mask = dof_mask.to(inputs_embeds.device).to(inputs_embeds.dtype)
+                noisy_action_emb, flow = self.action_preprocessor(
+                    action_chunk, dataset_names, dof_mask
+                )
+                mask = input_ids == self.action_token_id_set["action_token_id"]
+                mask_unsqueezed = mask.unsqueeze(-1)
+                mask_expanded = mask_unsqueezed.expand_as(inputs_embeds)
+                action_mask = mask_expanded.to(inputs_embeds.device)
+
+                noisy_action_emb = noisy_action_emb.to(
+                    inputs_embeds.device, inputs_embeds.dtype
+                )
+                inputs_embeds = inputs_embeds.masked_scatter(
+                    action_mask, noisy_action_emb
+                )
+
+            if attention_mask is not None:
+                attention_mask = attention_mask.to(inputs_embeds.device)
+
+        # Forward pass through the main model
+        outputs = self.model(
+            input_ids=None,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            moe_token_types=moe_token_types,  # Pass token types for MoE routing
+            start_indices=start_indices,
+            end_indices=end_indices,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
+
+        hidden_states = outputs[0]
+        return hidden_states
 
     def predict_action(self, predict_mode: str, **kwargs):
         """
@@ -2080,6 +2337,8 @@ class Qwen2_5_VLMoEForAction(Qwen2_5_VLForConditionalGeneration):
         elif mode == "validate":
             with torch.no_grad():
                 return self.train_step_forward(use_cache=False, **kwargs)
+        elif mode == "get_embeddings":
+            return self.get_embeddings(use_cache=False, **kwargs)
         else:
             raise NotImplementedError("invalid key")
 
